@@ -113,7 +113,21 @@ document.querySelectorAll('.q-card').forEach(card => {
   });
 });
 
-// ── pano ID extraction ────────────────────────────────────────────────────────
+// ── URL type detection ────────────────────────────────────────────────────────
+function isPhotosphere(input) {
+  return input.includes('!2e10') || input.includes('gpms-cs-s');
+}
+
+function extractPhotosphere(input) {
+  // Hash sits between gpms-cs-s/ and the first = (URL-encoded as %3D or raw)
+  const m = input.match(/gpms-cs-s(?:%2F|\/)([A-Za-z0-9_\-]+)(?:%3D|=)/);
+  if (!m) return null;
+  const wm = input.match(/!7i(\d+)/);
+  const hm = input.match(/!8i(\d+)/);
+  return { hash: m[1], maxW: wm ? +wm[1] : 7200, maxH: hm ? +hm[1] : 3600 };
+}
+
+// ── pano ID extraction (regular Street View) ──────────────────────────────────
 function extractPanoId(input) {
   input = input.trim();
   if (!input.includes('/') && input.length >= 15) return input;
@@ -182,26 +196,54 @@ async function start() {
   const urlInput = document.getElementById('url').value.trim();
   if (!urlInput) { alert('Please paste a Google Maps Street View URL.'); return; }
 
-  const panoId = extractPanoId(urlInput);
-  if (!panoId) {
-    showError("Couldn't find a panorama ID in that URL. Make sure it's a Street View URL.");
-    return;
-  }
-
   hide('result-card'); hide('error-card');
   show('progress-card');
   setBtn(true, 'Downloading…');
-  setProgress(0, 'Fetching tiles…', '');
+  setProgress(0, 'Starting…', '');
 
   try {
+    // ── photosphere (user-contributed 360 photo) ──────────────────────────────
+    if (isPhotosphere(urlInput)) {
+      const info = extractPhotosphere(urlInput);
+      if (!info) throw new Error("Couldn't extract photosphere data from URL.");
+
+      // Map quality selector → resolution fraction of max
+      const scale = { 3: 0.25, 4: 0.5, 5: 1.0 }[selectedZoom] ?? 0.5;
+      const w = Math.round(info.maxW * scale);
+      const h = Math.round(info.maxH * scale);
+
+      setProgress(10, 'Downloading photosphere…', `${w.toLocaleString()} × ${h.toLocaleString()} px`);
+
+      const resp = await fetch(
+        `https://lh3.googleusercontent.com/gpms-cs-s/${info.hash}=w${w}-h${h}`,
+        { mode: 'cors' }
+      );
+      if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
+
+      setProgress(90, 'Encoding…', '');
+      const blob = await resp.blob();
+      const objUrl = URL.createObjectURL(blob);
+
+      const dlLink = document.getElementById('dl-link');
+      dlLink.href     = objUrl;
+      dlLink.download = `photosphere_${info.hash.slice(0, 10)}.jpg`;
+      document.getElementById('preview').src = objUrl;
+      document.getElementById('result-info').textContent =
+        `${w.toLocaleString()} × ${h.toLocaleString()} px · JPEG · ${(blob.size/1024/1024).toFixed(1)} MB (photosphere)`;
+      show('result-card');
+      setProgress(100, 'Done!', '');
+      return;
+    }
+
+    // ── regular Street View (tile stitching) ──────────────────────────────────
+    const panoId = extractPanoId(urlInput);
+    if (!panoId) throw new Error("Couldn't find a panorama ID in that URL. Make sure it's a Street View URL.");
+
     const canvas = await buildPanorama(panoId, selectedZoom, (done, total) => {
-      const pct = Math.round(done / total * 100);
-      setProgress(pct, 'Downloading tiles…', `${done} / ${total} tiles`);
+      setProgress(Math.round(done / total * 100), 'Downloading tiles…', `${done} / ${total} tiles`);
     });
 
     setProgress(100, 'Encoding image…', '');
-
-    // canvas.toBlob works in all browsers; convertToBlob is OffscreenCanvas-only
     const blob = await new Promise((resolve, reject) =>
       canvas.toBlob(b => b ? resolve(b) : reject(new Error('Encoding failed')), 'image/jpeg', 0.92)
     );
@@ -210,13 +252,12 @@ async function start() {
     const dlLink = document.getElementById('dl-link');
     dlLink.href     = objUrl;
     dlLink.download = `streetview_${panoId}.jpg`;
-
     document.getElementById('preview').src = objUrl;
     document.getElementById('result-info').textContent =
       `${canvas.width.toLocaleString()} × ${canvas.height.toLocaleString()} px · JPEG · ${(blob.size/1024/1024).toFixed(1)} MB`;
-
     show('result-card');
     setProgress(100, 'Done!', '');
+
   } catch(e) {
     showError(e.message || String(e));
   } finally {
